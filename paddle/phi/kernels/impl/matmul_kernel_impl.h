@@ -121,6 +121,8 @@ void MatMulFunctionImplWithBlas(
     bool trans_y,
     bool flag = false,
     phi::funcs::MatmulPlanner* matmul_planner UNUSED = nullptr) {
+  const T kAlpha{1.0};  // no integrated scale after matmul
+  const T kBeta{flag};
   const int x_ndim = x_dims.size();
   const int y_ndim = y_dims.size();
 
@@ -130,6 +132,168 @@ void MatMulFunctionImplWithBlas(
 
   auto blas = phi::funcs::GetBlas<Context, T>(dev_ctx);
 
+  // ---------------------- linalg lambdas ----------------------
+  // Helper lambda to get CBLAS_TRANSPOSE enum
+  auto get_trans = [](bool trans) { return trans ? CblasTrans : CblasNoTrans; };
+
+  auto dot = [&](int64_t n, const T* x, const T* y, T* out) {
+    constexpr int kXstride = 1;
+    constexpr int kYstride = 1;
+    if constexpr (!std::is_same<Context, phi::GPUContext>::value) {
+      *out = blas.DOT(n, x, y);
+    } else {
+      blas.CUDOT(n, x, kXstride, y, kYstride, out);
+    }
+  };
+
+  auto gemv =
+      [&](bool trans_a, int64_t m, int64_t n, const T* A, const T* x, T* y) {
+        blas.GEMV(trans_a, m, n, kAlpha, A, x, kBeta, y);
+      };
+
+  auto gemm = [&](CBLAS_TRANSPOSE transA,
+                  CBLAS_TRANSPOSE transB,
+                  int64_t M,
+                  int64_t N,
+                  int64_t K,
+                  const T* A,
+                  const T* B,
+                  T* C) {
+    blas.GEMM(transA, transB, M, N, K, kAlpha, A, B, kBeta, C);
+  };
+
+  auto batched_gemm = [&](CBLAS_TRANSPOSE transA,
+                          CBLAS_TRANSPOSE transB,
+                          int64_t M,
+                          int64_t N,
+                          int64_t K,
+                          const T* A,
+                          const T* B,
+                          T* C,
+                          int64_t batch_size,
+                          int64_t lda = 0,
+                          int64_t ldb = 0) {
+    blas.BatchedGEMM(
+        transA, transB, M, N, K, kAlpha, A, B, kBeta, C, batch_size, lda, ldb);
+  };
+
+  auto batched_gemm_vec = [&](CBLAS_TRANSPOSE transA,
+                              CBLAS_TRANSPOSE transB,
+                              int64_t M,
+                              int64_t N,
+                              int64_t K,
+                              const T** A,
+                              const T** B,
+                              T** C,
+                              int64_t batch_size) {
+    // Overridden BatchedGEMM
+    blas.BatchedGEMM(get_trans(transA),
+                     get_trans(transB),
+                     M,
+                     N,
+                     K,
+                     kAlpha,
+                     A,
+                     B,
+                     kBeta,
+                     C,
+                     batch_size);
+  };
+
+  // Generic dimension check lambda
+  auto check_dim = [&](const std::vector<size_t>& dims,
+                       int idx,
+                       int expected,
+                       const std::string& proposed_tag,
+                       const std::string& expected_tag) {
+    PADDLE_ENFORCE_EQ(
+        dims[idx],
+        expected,
+        common::errors::InvalidArgument(
+            proposed_tag + "'s numbers must be equal to " + expected_tag +
+                "'s numbers, "
+                ". But received X has [%d] elements, received Y has [%d] "
+                "elements.",
+            expected,
+            dims[idx]));
+    return idx;
+  };
+  // ------------------------ matmul case handle ----------------------
+  /*
+    MatMul's cases:
+    1. X's dims = 1, Y's dims = 1, using blas.DOT
+    2. X's dims > 1, Y's dims = 1, using blas.GEMV
+    3. X's dims = 1, Y's dims = 2, using blas.GEMM with reshape
+    4. X's dims = 2, Y's dims = 2, using blas.GEMM
+    5. X or Y's dims > 2, and other's dims = 2, try fold and using blas.GEMM
+    6. If all folding and reshape failed, using blas.BatchedGEMM
+  */
+
+  // Expected canonical shape: (B_foo, M, K) x (B_bar, K, N) -> (B_broadcasted,
+  // M, N)
+  const size_t x_accum_dim_idx =
+      x_ndim >= 2 ? (trans_x ? x_ndim - 2 : x_ndim - 1) : 0;
+  const size_t y_accum_dim_idx =
+      y_ndim >= 2 ? (trans_y ? y_ndim - 1 : y_ndim - 2) : 0;
+  const size_t kX = x_dims[x_accum_dim_idx];
+  const size_t kY = y_dims[y_accum_dim_idx];
+  check_dim({kX}, 0, kY, "k proposed by X", "k proposed by Y");
+
+  if (x_ndim == 1 && y_ndim == 1) {
+    // Case1: 1D x 1D, dot(CUDA) or GEMM(backward compatible)
+    const size_t kX = X.dims()[0];
+    const size_t kY = Y.dims()[0];
+    Out->Resize(common::make_ddim({}));
+    dev_ctx.template Alloc<T>(Out);
+    dot(kX, y_data, x_data, dev_ctx.template Alloc<T>(Out));
+    return;
+  } else if (x_ndim == 2 && y_ndim == 1) {
+    // Case2: 2D x 1D, GEMV
+    const size_t kY = Y.dims()[0];
+    const size_t kX = trans_x ? X.dims()[0] : X.dims()[1];
+    const size_t M = trans_x ? X.dims()[1] : X.dims()[0];
+    std::vector<std::int64_t> out_dims(1);
+    out_dims[0] = M;
+    Out->ResizeAndAllocate(common::make_ddim(out_dims));
+    gemv(trans_x, M, kX, x_data, y_data, dev_ctx.template Alloc<T>(Out));
+    return;
+  }
+  /*
+  else if(x_ndim == 1 && y_ndim == 2){
+     // Case3: 1D x 2D, GEMM
+     constexpr size_t M = 1;
+     const size_t N = trans_y ? Y.dims()[0] : Y.dims()[1];
+     std::vector<std::int64_t> out_dims(2);
+     out_dims[0] = 1;
+     out_dims[1] = N;
+     Out->ResizeAndAllocate(common::make_ddim(out_dims));
+     gemm(get_trans(trans_x), get_trans(trans_y), M, N, kX, x_data, y_data,
+   dev_ctx.template Alloc<T>(Out)); return; }else if(x_ndim==2 && y_ndim == 2){
+     const size_t M = trans_x ? X.dims()[1] : X.dims()[0];
+     const size_t N = trans_y ? Y.dims()[1] : Y.dims()[0];
+     std::vector<std::int64_t> out_dims(2);
+     out_dims[0] = M;
+     out_dims[1] = N;
+     Out->ResizeAndAllocate(common::make_ddim(out_dims));
+     gemm(get_trans(trans_x), get_trans(trans_y), M, N, kX, x_data, y_data,
+   dev_ctx.template Alloc<T>(Out)); }else if(x_ndim == 3 && y_ndim == 2){
+     // only support BMK x NK or MK x BNK
+     const size_t B = X.dims()[0];
+     const size_t M = X.dims()[1];
+     const size_t BM = B * M;
+     const size_t N = y_dims[0];
+     const size_t K = x_dims[x_ndim - 1];
+     std::vector<std::int64_t> out_dims(3);
+     out_dims[0] = B;
+     out_dims[1] = M;
+     out_dims[2] = N;
+     Out->ResizeAndAllocate(common::make_ddim(out_dims));
+     gemm(get_trans(trans_x), get_trans(trans_y), BM, N, K, x_data, y_data,
+   dev_ctx.template Alloc<T>(Out)); return;
+   }
+   */
+
+  // ====================== has some problem below ======================
   if (x_ndim == 1 && y_ndim == 1) {
     const int64_t M = X.numel();
     const int64_t N = Y.numel();
@@ -145,44 +309,19 @@ void MatMulFunctionImplWithBlas(
     VLOG(3) << "MatMul's case 1";
     Out->Resize(common::make_ddim({}));
     dev_ctx.template Alloc<T>(Out);
-    blas.GEMM(CblasNoTrans,
-              CblasTrans,
-              1,
-              1,
-              M,
-              static_cast<T>(1),
-              y_data,
-              x_data,
-              static_cast<T>(flag),
-              dev_ctx.template Alloc<T>(Out));
+    gemm(CblasNoTrans,
+         CblasTrans,
+         1,
+         1,
+         M,
+         y_data,
+         x_data,
+         dev_ctx.template Alloc<T>(Out));
     return;
   }
-
+  // Handle 1D x ND case
   if (x_ndim == 1) {
     const int64_t N = X.numel();
-    if (trans_y) {
-      PADDLE_ENFORCE_EQ(
-          y_dims[y_ndim - 1],
-          N,
-          common::errors::InvalidArgument("Input(Y) has error dim. "
-                                          "Y'dims[%d] must be equal to %d, "
-                                          "but received Y'dims[%d] is %d.",
-                                          y_ndim - 1,
-                                          N,
-                                          y_ndim - 1,
-                                          y_dims[y_ndim - 1]));
-    } else {
-      PADDLE_ENFORCE_EQ(
-          y_dims[y_ndim - 2],
-          N,
-          common::errors::InvalidArgument("Input(Y) has error dim. "
-                                          "Y'dims[%d] must be equal to %d, "
-                                          "but received Y'dims[%d] is %d.",
-                                          y_ndim - 2,
-                                          N,
-                                          y_ndim - 2,
-                                          y_dims[y_ndim - 2]));
-    }
     std::vector<std::int64_t> out_dims(y_ndim - 1);
     if (trans_y) {
       std::copy_n(y_dims.cbegin(), y_ndim - 1, out_dims.begin());
@@ -192,75 +331,45 @@ void MatMulFunctionImplWithBlas(
     }
     Out->ResizeAndAllocate(common::make_ddim(out_dims));
     dev_ctx.template Alloc<T>(Out);
+
     if (trans_y) {
       const int64_t M = Y.numel() / N;
-      VLOG(3) << "MatMul's case 2";
-      blas.GEMV(false,
-                M,
-                N,
-                static_cast<T>(1),
-                y_data,
-                x_data,
-                static_cast<T>(flag),
-                dev_ctx.template Alloc<T>(Out));
+      gemv(false, M, N, y_data, x_data, dev_ctx.template Alloc<T>(Out));
     } else {
       const int64_t M = y_dims[y_ndim - 1];
       const int64_t batch_size = Y.numel() / (M * N);
       if (batch_size == 1) {
-        VLOG(3) << "MatMul's case 3";
-        blas.GEMV(true,
-                  N,
-                  M,
-                  static_cast<T>(1),
-                  y_data,
-                  x_data,
-                  static_cast<T>(flag),
-                  dev_ctx.template Alloc<T>(Out));
+        gemv(true, N, M, y_data, x_data, dev_ctx.template Alloc<T>(Out));
       } else {
-        VLOG(3) << "MatMul's case 4";
-        blas.BatchedGEMM(CblasTrans,
-                         CblasNoTrans,
-                         M,
-                         1,
-                         N,
-                         static_cast<T>(1),
-                         y_data,
-                         x_data,
-                         static_cast<T>(flag),
-                         dev_ctx.template Alloc<T>(Out),
-                         batch_size,
-                         M * N,
-                         0);
+        batched_gemm(CblasTrans,
+                     CblasNoTrans,
+                     M,
+                     1,
+                     N,
+                     y_data,
+                     x_data,
+                     dev_ctx.template Alloc<T>(Out),
+                     batch_size,
+                     M * N,
+                     0);
       }
     }
     return;
   }
 
+  // Handle ND x 1D case
   if (y_ndim == 1) {
     const int64_t N = Y.numel();
-    if (trans_x) {
-      PADDLE_ENFORCE_EQ(
-          x_dims[x_ndim - 2],
-          N,
-          common::errors::InvalidArgument("Input(X) has error dim. "
-                                          "X'dims[%d] must be equal to %d. "
-                                          "But received X'dims[%d] is %d",
-                                          x_ndim - 2,
-                                          N,
-                                          x_ndim - 2,
-                                          x_dims[x_ndim - 2]));
-    } else {
-      PADDLE_ENFORCE_EQ(
-          x_dims[x_ndim - 1],
-          N,
-          common::errors::InvalidArgument("Input(X) has error dim. "
-                                          "X'dims[%d] must be equal to %d. "
-                                          "But received X'dims[%d] is %d",
-                                          x_ndim - 1,
-                                          N,
-                                          x_ndim - 1,
-                                          x_dims[x_ndim - 1]));
-    }
+    /*
+    int dim_idx = trans_x ?
+      check_dim(x_dims, x_ndim - 2, N,
+                "Input(X) has error dim. X'dims[%d] must be equal to %d, "
+                "but received X'dims[%d] is %d") :
+      check_dim(x_dims, x_ndim - 1, N,
+                "Input(X) has error dim. X'dims[%d] must be equal to %d, "
+                "but received X'dims[%d] is %d");
+                */
+
     std::vector<std::int64_t> out_dims(x_ndim - 1);
     if (trans_x) {
       std::copy_n(x_dims.cbegin(), x_ndim - 2, out_dims.begin());
@@ -276,70 +385,42 @@ void MatMulFunctionImplWithBlas(
       const int64_t batch_size = X.numel() / (M * N);
       if (batch_size == 1) {
         VLOG(3) << "MatMul's case 5";
-        blas.GEMV(true,
-                  N,
-                  M,
-                  static_cast<T>(1),
-                  x_data,
-                  y_data,
-                  static_cast<T>(flag),
-                  dev_ctx.template Alloc<T>(Out));
+        gemv(true, N, M, x_data, y_data, dev_ctx.template Alloc<T>(Out));
       } else {
         VLOG(3) << "MatMul's case 6";
-        blas.BatchedGEMM(CblasTrans,
-                         CblasNoTrans,
-                         M,
-                         1,
-                         N,
-                         static_cast<T>(1),
-                         x_data,
-                         y_data,
-                         static_cast<T>(flag),
-                         dev_ctx.template Alloc<T>(Out),
-                         batch_size,
-                         M * N,
-                         0);
+        batched_gemm(CblasTrans,
+                     CblasNoTrans,
+                     M,
+                     1,
+                     N,
+                     x_data,
+                     y_data,
+                     dev_ctx.template Alloc<T>(Out),
+                     batch_size,
+                     M * N,
+                     0);
       }
     } else {
       const int64_t M = X.numel() / N;
       VLOG(3) << "MatMul's case 7";
-      blas.GEMV(false,
-                M,
-                N,
-                static_cast<T>(1),
-                x_data,
-                y_data,
-                static_cast<T>(flag),
-                dev_ctx.template Alloc<T>(Out));
+      gemv(false, M, N, x_data, y_data, dev_ctx.template Alloc<T>(Out));
     }
     return;
   }
 
+  // Handle ND x ND case
   const int64_t M = trans_x ? x_dims[x_ndim - 1] : x_dims[x_ndim - 2];
   const int64_t K = trans_x ? x_dims[x_ndim - 2] : x_dims[x_ndim - 1];
-  if (trans_y) {
-    PADDLE_ENFORCE_EQ(
-        y_dims[y_ndim - 1],
-        K,
-        common::errors::InvalidArgument("Input(Y) has error dim. "
-                                        "Y'dims[%d] must be equal to %d, "
-                                        "but received Y'dims[%d] is %d.",
-                                        y_ndim - 1,
-                                        K,
-                                        y_ndim - 1,
-                                        y_dims[y_ndim - 1]));
-  } else {
-    PADDLE_ENFORCE_EQ(
-        y_dims[y_ndim - 2],
-        K,
-        common::errors::InvalidArgument("Input(Y) has error dim. "
-                                        "Y'dims[%d] must be equal to %d, "
-                                        "but received Y'dims[%d] is %d.",
-                                        y_ndim - 2,
-                                        K,
-                                        y_ndim - 2,
-                                        y_dims[y_ndim - 2]));
-  }
+  /*
+  int dim_idx = trans_y ?
+    check_dim(y_dims, y_ndim - 1, K,
+              "Input(Y) has error dim. Y'dims[%d] must be equal to %d, "
+              "but received Y'dims[%d] is %d.") :
+    check_dim(y_dims, y_ndim - 2, K,
+              "Input(Y) has error dim. Y'dims[%d] must be equal to %d, "
+              "but received Y'dims[%d] is %d.");
+  */
+
   const int64_t N = trans_y ? y_dims[y_ndim - 2] : y_dims[y_ndim - 1];
   const int64_t ndim = (std::max)(x_ndim, y_ndim);
   std::vector<std::int64_t> x_broadcast_dims(ndim);
@@ -382,89 +463,78 @@ void MatMulFunctionImplWithBlas(
                       1LL,
                       std::multiplies<std::int64_t>());
   if (out_batch_size == 0) return;
+  // Execute the appropriate BLAS operation based on the batch sizes
   if (x_batch_size == 1 && y_batch_size == 1) {
     VLOG(3) << "MatMul's case 8";
-    blas.GEMM(trans_x ? CblasTrans : CblasNoTrans,
-              trans_y ? CblasTrans : CblasNoTrans,
-              M,
-              N,
-              K,
-              static_cast<T>(1),
-              x_data,
-              y_data,
-              static_cast<T>(flag),
-              dev_ctx.template Alloc<T>(Out));
+    gemm(get_trans(trans_x),
+         get_trans(trans_y),
+         M,
+         N,
+         K,
+         x_data,
+         y_data,
+         dev_ctx.template Alloc<T>(Out));
   } else if (x_batch_size == 1) {
     if (M == 1 && trans_y) {
       VLOG(3) << "MatMul's case 9";
-      blas.GEMV(false,
-                y_batch_size * N,
-                K,
-                static_cast<T>(1),
-                y_data,
-                x_data,
-                static_cast<T>(flag),
-                dev_ctx.template Alloc<T>(Out));
+      gemv(false,
+           y_batch_size * N,
+           K,
+           y_data,
+           x_data,
+           dev_ctx.template Alloc<T>(Out));
     } else {
       VLOG(3) << "MatMul's case 10";
-      blas.BatchedGEMM(trans_x ? CblasTrans : CblasNoTrans,
-                       trans_y ? CblasTrans : CblasNoTrans,
-                       M,
-                       N,
-                       K,
-                       static_cast<T>(1),
-                       x_data,
-                       y_data,
-                       static_cast<T>(flag),
-                       dev_ctx.template Alloc<T>(Out),
-                       out_batch_size,
-                       0,
-                       K * N);
+      batched_gemm(get_trans(trans_x),
+                   get_trans(trans_y),
+                   M,
+                   N,
+                   K,
+                   x_data,
+                   y_data,
+                   dev_ctx.template Alloc<T>(Out),
+                   out_batch_size,
+                   0,
+                   K * N);
     }
   } else if (y_batch_size == 1) {
     if (!trans_x) {
       VLOG(3) << "MatMul's case 11";
-      blas.GEMM(CblasNoTrans,
-                trans_y ? CblasTrans : CblasNoTrans,
-                x_batch_size * M,
-                N,
-                K,
-                static_cast<T>(1),
-                x_data,
-                y_data,
-                static_cast<T>(flag),
-                dev_ctx.template Alloc<T>(Out));
+      gemm(CblasNoTrans,
+           get_trans(trans_y),
+           x_batch_size * M,
+           N,
+           K,
+           x_data,
+           y_data,
+           dev_ctx.template Alloc<T>(Out));
     } else {
       VLOG(3) << "MatMul's case 12";
-      blas.BatchedGEMM(CblasTrans,
-                       trans_y ? CblasTrans : CblasNoTrans,
-                       M,
-                       N,
-                       K,
-                       static_cast<T>(1),
-                       x_data,
-                       y_data,
-                       static_cast<T>(flag),
-                       dev_ctx.template Alloc<T>(Out),
-                       out_batch_size,
-                       M * K,
-                       0);
+      batched_gemm(CblasTrans,
+                   get_trans(trans_y),
+                   M,
+                   N,
+                   K,
+                   x_data,
+                   y_data,
+                   dev_ctx.template Alloc<T>(Out),
+                   out_batch_size,
+                   M * K,
+                   0);
     }
   } else if (!is_broadcast_dims) {
     VLOG(3) << "MatMul's case 13";
-    blas.BatchedGEMM(trans_x ? CblasTrans : CblasNoTrans,
-                     trans_y ? CblasTrans : CblasNoTrans,
-                     M,
-                     N,
-                     K,
-                     static_cast<T>(1),
-                     x_data,
-                     y_data,
-                     static_cast<T>(flag),
-                     dev_ctx.template Alloc<T>(Out),
-                     out_batch_size,
-                     M * K,
-                     K * N);
+    batched_gemm(get_trans(trans_x),
+                 get_trans(trans_y),
+                 M,
+                 N,
+                 K,
+                 x_data,
+                 y_data,
+                 dev_ctx.template Alloc<T>(Out),
+                 out_batch_size,
+                 M * K,
+                 K * N);
   } else {
     // in the case, can't use stridedgemm
     std::vector<const T*> x_ptr(out_batch_size);
@@ -484,15 +554,13 @@ void MatMulFunctionImplWithBlas(
       IndexIncreaseFromDims(batch_dim, out_broadcast_dims.data(), index.data());
     }
     VLOG(3) << "MatMul's case 14";
-    blas.BatchedGEMM(trans_x ? CblasTrans : CblasNoTrans,
-                     trans_y ? CblasTrans : CblasNoTrans,
+    batched_gemm_vec(get_trans(trans_x),
+                     get_trans(trans_y),
                      M,
                      N,
                      K,
-                     static_cast<T>(1),
                      x_ptr.data(),
                      y_ptr.data(),
-                     static_cast<T>(flag),
                      out_ptr.data(),
                      out_batch_size);
   }

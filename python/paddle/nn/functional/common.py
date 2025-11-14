@@ -2495,7 +2495,14 @@ def linear(
     """
     if in_dynamic_mode():
         # TODO(jiabin): using addmm for fast forward route
-        return _C_ops.linear(x, weight, bias)
+        if bias is not None:
+            out, _ = _C_ops.fused_gemm_epilogue(
+                x, weight, bias, False, False, "none"
+            )
+        else:
+            out = _C_ops.matmul(x, weight, False, False)
+
+        return out
 
     elif in_pir_mode():
         out = _C_ops.matmul(x, weight, False, False)
