@@ -49,7 +49,8 @@ __global__ __launch_bounds__(256) void tokens_zip_kernel(
   // Strided load: blockDim.x may be < num_experts, so each thread
   // handles multiple slots to cover the full [0, num_experts) range.
   for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
-    const int fetch_row = zipped_expertwise_rowmap[this_row * num_experts + i];
+    const int fetch_row =
+        zipped_expertwise_rowmap[(int64_t)this_row * num_experts + i];
     local_row_fetchlist[i] = fetch_row;
     if constexpr (WEIGHTED_TOKEN) {
       local_row_weight[i] =
@@ -61,11 +62,11 @@ __global__ __launch_bounds__(256) void tokens_zip_kernel(
 
 #pragma unroll
   for (int k = 0; k < topk; ++k) {
-    const int expert_idx = expert_routemap_topk[this_row * topk + k];
+    const int expert_idx = expert_routemap_topk[(int64_t)this_row * topk + k];
     if (expert_idx < 0) [[likely]]
       continue;
     const int expert_fetch_row = local_row_fetchlist[expert_idx];
-    zipped_probs_topk[this_row * topk + k] =
+    zipped_probs_topk[(int64_t)this_row * topk + k] =
         unzipped_token_probs[expert_fetch_row];
   }
 

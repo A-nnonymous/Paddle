@@ -265,8 +265,8 @@ __global__ __launch_bounds__(BLOCK_DIM_X) void permute_kernel(
                       __popc((lane_id < 31) ? (mask >> (lane_id + 1)) : 0u);
         }
 
-        zipped_expertwise_rowmap[global_row * num_experts + expert_id] =
-            final_pos;
+        zipped_expertwise_rowmap[(int64_t)global_row * num_experts +
+                                 expert_id] = final_pos;
 #pragma unroll
         for (int k = 0; k < TOPK; k++) {
           if (reg_expert[k] == expert_id) {
